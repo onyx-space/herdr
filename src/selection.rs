@@ -300,7 +300,7 @@ fn should_prefer_osc52() -> bool {
         std::env::var_os("SSH_TTY").as_deref(),
         std::env::var_os("VSCODE_IPC_HOOK_CLI").as_deref(),
         is_wsl(),
-    )
+    ) || std::env::var_os("HERDR_CLIPBOARD_OSC52").is_some()
 }
 
 /// Write clipboard bytes to the system clipboard via native platform tools or OSC 52.
