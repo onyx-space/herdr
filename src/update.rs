@@ -698,8 +698,7 @@ fn install_downloaded_update(mut update: DownloadedUpdate) -> Result<(), String>
     Ok(())
 }
 
-#[cfg(windows)]
-const WINDOWS_INSTALLER: &str = include_str!("../distribution/install.ps1");
+pub(crate) const WINDOWS_INSTALLER: &str = include_str!("../distribution/install.ps1");
 
 #[cfg(windows)]
 struct DownloadedWindowsUpdate {
@@ -2852,6 +2851,8 @@ mod tests {
                 endpoint_protocol_generation: Some(
                     crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
                 ),
+                surface_interest: true,
+                health_check: true,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -2924,6 +2925,8 @@ mod tests {
                     endpoint_protocol_generation: Some(
                         crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
                     ),
+                    surface_interest: true,
+                    health_check: true,
                 }),
             },
         };
@@ -3180,6 +3183,8 @@ mod tests {
                     endpoint_protocol_generation: Some(
                         crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
                     ),
+                    surface_interest: true,
+                    health_check: true,
                 }),
             },
         };
