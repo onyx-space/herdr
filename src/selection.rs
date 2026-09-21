@@ -347,6 +347,10 @@ fn should_prefer_osc52() -> bool {
     // WSL sessions only need OSC 52 when interop cannot reach the Windows clipboard;
     // otherwise the platform layer writes the clipboard the user actually sees, and
     // `write_osc52_bytes` still falls back here when that write fails.
+    //
+    // `HERDR_CLIPBOARD_OSC52` stays an explicit escape hatch with priority over that
+    // decision: terminal-bridge sessions with no local clipboard (for example the
+    // `glitter-terminal-*` units) set it and must keep emitting OSC 52 only.
     should_prefer_osc52_for_env(
         std::env::var_os("SSH_CONNECTION").as_deref(),
         std::env::var_os("SSH_TTY").as_deref(),

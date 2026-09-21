@@ -995,10 +995,16 @@ const WSL_CLIPBOARD_PROGRAM: &str = "powershell.exe";
 const WSL_CLIPBOARD_PROGRAM_WINDOWS_PATH: &str =
     r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
 
-/// How long a WSL clipboard command may run before it is abandoned. PowerShell startup
-/// costs a few hundred milliseconds; the bound only exists so a wedged interop channel
-/// cannot freeze the client forever instead of falling back to OSC 52.
-const WSL_CLIPBOARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// How long a WSL clipboard command may run before it is abandoned.
+///
+/// PowerShell startup costs a few hundred milliseconds and WSL copies run it
+/// synchronously on the client event loop; two seconds is a deliberate trade-off that
+/// stays above the observed startup cost while keeping that stall short. The bound
+/// exists so a wedged interop channel cannot freeze the client forever instead of
+/// falling back to OSC 52.
+const WSL_CLIPBOARD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
 
 /// Reads stdin as UTF-8 and puts it on the Windows clipboard.
 ///
@@ -1045,14 +1051,23 @@ fn wsl_windows_clipboard_program() -> Option<&'static str> {
 }
 
 fn detect_wsl_windows_clipboard_program() -> Option<&'static str> {
+    resolve_wsl_windows_clipboard_program(program_on_path(WSL_CLIPBOARD_PROGRAM), wslpath_to_unix)
+}
+
+/// Picks the WSL clipboard program, with the two inputs injected so the fallback stays
+/// testable without rewriting the process `PATH`.
+fn resolve_wsl_windows_clipboard_program(
+    program_on_path: bool,
+    resolve_windows_path: impl FnOnce(&str) -> Option<String>,
+) -> Option<&'static str> {
     // The common case: interop appends the Windows PATH, so the bare name resolves.
-    if program_on_path(WSL_CLIPBOARD_PROGRAM) {
+    if program_on_path {
         return Some(WSL_CLIPBOARD_PROGRAM);
     }
 
     // `appendWindowsPath=false` hides that entry, so fall back to the Windows path
     // converted through wslpath.
-    let resolved = wslpath_to_unix(WSL_CLIPBOARD_PROGRAM_WINDOWS_PATH)?;
+    let resolved = resolve_windows_path(WSL_CLIPBOARD_PROGRAM_WINDOWS_PATH)?;
     std::path::Path::new(&resolved)
         .is_file()
         .then(|| &*Box::leak(resolved.into_boxed_str()))
@@ -1191,7 +1206,9 @@ fn read_clipboard_text_commands_for_env(
 }
 
 fn read_clipboard_text_with_command(command: &ClipboardCommand) -> Option<String> {
-    const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
+    if command.program.ends_with(WSL_CLIPBOARD_PROGRAM) {
+        return read_wsl_clipboard_text_command(command);
+    }
 
     let mut child = Command::new(command.program)
         .args(command.args)
@@ -1229,6 +1246,10 @@ fn read_clipboard_text_with_command(command: &ClipboardCommand) -> Option<String
 }
 
 fn run_clipboard_command(command: &ClipboardCommand, bytes: &[u8]) -> bool {
+    if command.program.ends_with(WSL_CLIPBOARD_PROGRAM) {
+        return write_wsl_clipboard_command(command, bytes);
+    }
+
     let mut child = match Command::new(command.program)
         .args(command.args)
         .stdin(Stdio::piped())
@@ -1257,35 +1278,110 @@ fn run_clipboard_command(command: &ClipboardCommand, bytes: &[u8]) -> bool {
         return wait_for_wl_copy_startup(child);
     }
 
-    if command.program.ends_with(WSL_CLIPBOARD_PROGRAM) {
-        return wait_for_wsl_clipboard_command(child);
-    }
-
     child.wait().map(|status| status.success()).unwrap_or(false)
 }
 
-/// Waits for a WSL clipboard command that is expected to exit, unlike `wl-copy`, and
-/// abandons it on timeout so an unresponsive interop channel cannot freeze the client.
-fn wait_for_wsl_clipboard_command(mut child: std::process::Child) -> bool {
+/// Puts `bytes` on the Windows clipboard through a WSL clipboard command.
+///
+/// The deadline covers the whole operation, not just the final `wait`: interop can wedge
+/// while PowerShell starts or while it reads a payload larger than the pipe buffer, so
+/// the stdin write runs on a worker thread and the main thread only polls `try_wait`.
+/// Killing the child unblocks that `write_all` with `EPIPE`, which is why the join below
+/// cannot outlive the deadline.
+fn write_wsl_clipboard_command(command: &ClipboardCommand, bytes: &[u8]) -> bool {
+    let mut child = match Command::new(command.program)
+        .args(command.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    };
+
+    let payload = bytes.to_vec();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&payload);
+    });
+
+    let status = wait_for_wsl_clipboard_command(&mut child);
+    let _ = writer.join();
+    matches!(status, Ok(Some(exit)) if exit.success())
+}
+
+/// Reads the Windows clipboard through a WSL clipboard command.
+///
+/// `read_limited_reader` runs on a worker thread because `Get-Clipboard` can block
+/// indefinitely while another process holds the Windows clipboard open; the main thread
+/// enforces the shared deadline and kills the child, turning a stuck read into an absent
+/// clipboard instead of a frozen client.
+fn read_wsl_clipboard_text_command(command: &ClipboardCommand) -> Option<String> {
+    let mut child = Command::new(command.program)
+        .args(command.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || read_limited_reader(stdout, MAX_CLIPBOARD_TEXT_BYTES));
+
+    let status = match wait_for_wsl_clipboard_command(&mut child) {
+        Ok(Some(status)) => status,
+        Ok(None) | Err(_) => {
+            let _ = reader.join();
+            return None;
+        }
+    };
+
+    let read = match reader.join() {
+        Ok(Ok(read)) => read,
+        Ok(Err(_)) | Err(_) => return None,
+    };
+
+    if !status.success() {
+        return None;
+    }
+
+    match read {
+        LimitedRead::Complete(bytes) => String::from_utf8(bytes).ok(),
+        LimitedRead::Empty | LimitedRead::Oversized => None,
+    }
+}
+
+/// Polls a WSL clipboard child until it exits or `WSL_CLIPBOARD_TIMEOUT` elapses. On
+/// timeout or `try_wait` error the child is killed and reaped, and the caller receives
+/// `Ok(None)`/`Err` so it can fall back instead of blocking.
+fn wait_for_wsl_clipboard_command(
+    child: &mut std::process::Child,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 
     let deadline = std::time::Instant::now() + WSL_CLIPBOARD_TIMEOUT;
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success(),
+            Ok(Some(status)) => return Ok(Some(status)),
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(POLL_INTERVAL);
             }
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                tracing::warn!("timed out writing the Windows clipboard from WSL");
-                return false;
+                tracing::warn!("timed out running a WSL clipboard command");
+                return Ok(None);
             }
-            Err(_) => {
+            Err(err) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return false;
+                return Err(err);
             }
         }
     }
@@ -1901,45 +1997,111 @@ mod tests {
     }
 
     #[test]
-    fn stalled_wsl_clipboard_command_does_not_block_the_write() {
-        use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    fn wsl_clipboard_program_prefers_path_over_wslpath() {
+        // When PATH resolves the program, the wslpath fallback must not be consulted.
+        assert_eq!(
+            resolve_wsl_windows_clipboard_program(true, |_| {
+                panic!("wslpath must not run when PATH resolves powershell.exe")
+            }),
+            Some(WSL_CLIPBOARD_PROGRAM)
+        );
+    }
+
+    #[test]
+    fn wsl_clipboard_program_falls_back_to_wslpath() {
+        let (temp_dir, program) = write_fake_powershell("wslpath-fallback", "#!/bin/sh\nexit 0\n");
+        let expected: &'static str =
+            Box::leak(program.to_string_lossy().into_owned().into_boxed_str());
+
+        let resolved = resolve_wsl_windows_clipboard_program(false, |windows_path| {
+            assert_eq!(windows_path, WSL_CLIPBOARD_PROGRAM_WINDOWS_PATH);
+            Some(expected.to_string())
+        });
+
+        assert_eq!(resolved, Some(expected));
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn wsl_clipboard_program_ignores_missing_wslpath_result() {
+        assert_eq!(resolve_wsl_windows_clipboard_program(false, |_| None), None);
+
+        let missing = std::env::temp_dir().join("herdr-missing-powershell.exe");
+        assert_eq!(
+            resolve_wsl_windows_clipboard_program(false, move |_| {
+                Some(missing.to_string_lossy().into_owned())
+            }),
+            None
+        );
+    }
+
+    /// The resolved fallback program has to be an existing file, because a wslpath result
+    /// that points at a nonexistent path must not be used to spawn.
+    fn write_fake_powershell(name: &str, script: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
 
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time should follow unix epoch")
             .as_nanos();
-        let temp_dir = std::env::temp_dir().join(format!(
-            "herdr-stalled-powershell-{}-{unique}",
-            std::process::id()
-        ));
+        let temp_dir =
+            std::env::temp_dir().join(format!("herdr-{name}-{}-{unique}", std::process::id()));
         std::fs::create_dir_all(&temp_dir).expect("temp dir should be created");
-        // The command is addressed by absolute path so the test never has to rewrite the
-        // process environment, which other clipboard tests read concurrently.
-        let fake_powershell = temp_dir.join("powershell.exe");
-        std::fs::write(&fake_powershell, "#!/bin/sh\nexec sleep 30\n")
-            .expect("fake powershell.exe should be written");
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut permissions = std::fs::metadata(&fake_powershell)
-                .expect("fake powershell.exe metadata")
-                .permissions();
-            permissions.set_mode(0o700);
-            std::fs::set_permissions(&fake_powershell, permissions)
-                .expect("fake powershell.exe should be executable");
-        }
-        let program: &'static str = Box::leak(
-            fake_powershell
-                .to_string_lossy()
-                .into_owned()
-                .into_boxed_str(),
+        let program = temp_dir.join("powershell.exe");
+        std::fs::write(&program, script).expect("fake powershell.exe should be written");
+        let mut permissions = std::fs::metadata(&program)
+            .expect("fake powershell.exe metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&program, permissions)
+            .expect("fake powershell.exe should be executable");
+        (temp_dir, program)
+    }
+
+    fn leaked_program(path: &std::path::Path) -> &'static str {
+        Box::leak(path.to_string_lossy().into_owned().into_boxed_str())
+    }
+
+    #[test]
+    fn stalled_wsl_clipboard_command_does_not_block_the_write() {
+        use std::time::{Duration, Instant};
+
+        // The fake powershell.exe never reads stdin. A 256 KiB payload exceeds the 64 KiB
+        // pipe buffer, so without a worker-thread write the event loop blocks in
+        // `write_all` before any deadline is armed and this test hangs.
+        let (temp_dir, program) =
+            write_fake_powershell("stalled-write", "#!/bin/sh\nexec sleep 30\n");
+        let commands = clipboard_commands_for_env(true, Some(leaked_program(&program)), true, true);
+
+        let payload = vec![b'x'; 256 * 1024];
+        let started = Instant::now();
+        assert!(!write_clipboard_with(&commands, &payload));
+        assert!(
+            started.elapsed() < WSL_CLIPBOARD_TIMEOUT + Duration::from_secs(3),
+            "a stalled WSL clipboard write must be abandoned so OSC 52 can run"
         );
-        let commands = clipboard_commands_for_env(true, Some(program), true, true);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn stalled_wsl_clipboard_read_does_not_block_the_paste() {
+        use std::time::{Duration, Instant};
+
+        // The fake powershell.exe never writes stdout, mirroring `Get-Clipboard` blocking
+        // while another process holds the Windows clipboard open.
+        let (temp_dir, program) =
+            write_fake_powershell("stalled-read", "#!/bin/sh\nexec sleep 30\n");
+        let command = ClipboardCommand {
+            program: leaked_program(&program),
+            args: WSL_CLIPBOARD_READ_ARGS,
+        };
 
         let started = Instant::now();
-        assert!(!write_clipboard_with(&commands, b"clipboard text"));
+        assert_eq!(read_clipboard_text_with_command(&command), None);
         assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "a stalled WSL clipboard command must be abandoned so OSC 52 can run"
+            started.elapsed() < WSL_CLIPBOARD_TIMEOUT + Duration::from_secs(3),
+            "a stalled WSL clipboard read must give up instead of freezing the client"
         );
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
