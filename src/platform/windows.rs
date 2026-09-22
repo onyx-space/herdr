@@ -2283,6 +2283,11 @@ pub fn read_clipboard_text() -> Option<String> {
     None
 }
 
+/// The Windows clipboard is only reachable from WSL.
+pub fn wsl_windows_clipboard_available() -> bool {
+    false
+}
+
 pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
     let operation = wide_null("open");
     let url = wide_null(url);

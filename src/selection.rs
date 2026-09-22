@@ -344,11 +344,18 @@ fn should_prefer_osc52_for_env(
 }
 
 fn should_prefer_osc52() -> bool {
+    // WSL sessions only need OSC 52 when interop cannot reach the Windows clipboard;
+    // otherwise the platform layer writes the clipboard the user actually sees, and
+    // `write_osc52_bytes` still falls back here when that write fails.
+    //
+    // `HERDR_CLIPBOARD_OSC52` stays an explicit escape hatch with priority over that
+    // decision: terminal-bridge sessions with no local clipboard (for example the
+    // `glitter-terminal-*` units) set it and must keep emitting OSC 52 only.
     should_prefer_osc52_for_env(
         std::env::var_os("SSH_CONNECTION").as_deref(),
         std::env::var_os("SSH_TTY").as_deref(),
         std::env::var_os("VSCODE_IPC_HOOK_CLI").as_deref(),
-        is_wsl(),
+        is_wsl() && !crate::platform::wsl_windows_clipboard_available(),
     ) || std::env::var_os("HERDR_CLIPBOARD_OSC52").is_some()
 }
 
@@ -438,6 +445,20 @@ mod tests {
     #[test]
     fn wsl_sessions_prefer_osc52() {
         assert!(should_prefer_osc52_for_env(None, None, None, true));
+    }
+
+    /// Manual WSL check for the decision that used to send every local WSL copy to OSC 52
+    /// even though the Windows clipboard was reachable through interop.
+    #[test]
+    #[ignore = "requires a live WSL session with a Windows clipboard"]
+    fn wsl_uses_the_windows_clipboard_instead_of_osc52() {
+        if !is_wsl()
+            || !crate::platform::wsl_windows_clipboard_available()
+            || std::env::var_os("HERDR_CLIPBOARD_OSC52").is_some()
+        {
+            return;
+        }
+        assert!(!should_prefer_osc52());
     }
 
     #[test]

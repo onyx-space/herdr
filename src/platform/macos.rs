@@ -638,6 +638,11 @@ pub fn write_clipboard(bytes: &[u8]) -> bool {
     )
 }
 
+/// The Windows clipboard is only reachable from WSL.
+pub fn wsl_windows_clipboard_available() -> bool {
+    false
+}
+
 pub fn read_clipboard_text() -> Option<String> {
     const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
 

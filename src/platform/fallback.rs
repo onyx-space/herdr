@@ -230,6 +230,11 @@ pub fn write_clipboard(_bytes: &[u8]) -> bool {
     false
 }
 
+/// Unsupported platform stub: the Windows clipboard is only reachable from WSL.
+pub fn wsl_windows_clipboard_available() -> bool {
+    false
+}
+
 /// Unsupported platform stub.
 pub fn read_clipboard_text() -> Option<String> {
     None
