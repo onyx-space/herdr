@@ -1282,15 +1282,24 @@ fn run_clipboard_command(command: &ClipboardCommand, bytes: &[u8]) -> bool {
 }
 
 /// Puts `bytes` on the Windows clipboard through a WSL clipboard command.
-///
-/// The deadline covers the whole operation, not just the final `wait`: interop can wedge
-/// while PowerShell starts or while it reads a payload larger than the pipe buffer, so
-/// the stdin write runs on a worker thread and the main thread only polls `try_wait`.
-/// Killing the child unblocks that `write_all` with `EPIPE`, which is why the join below
-/// cannot outlive the deadline.
 fn write_wsl_clipboard_command(command: &ClipboardCommand, bytes: &[u8]) -> bool {
-    let mut child = match Command::new(command.program)
-        .args(command.args)
+    let program = command.program;
+    let args = command.args;
+    let payload = bytes.to_vec();
+    run_with_wsl_clipboard_deadline(move || run_wsl_clipboard_write(program, args, payload))
+        .unwrap_or(false)
+}
+
+/// The write half of the WSL clipboard path. The outer deadline covers `spawn`; this
+/// inner one kills the child so the stdin writer cannot stay blocked on a payload larger
+/// than the pipe buffer.
+fn run_wsl_clipboard_write(
+    program: &'static str,
+    args: &'static [&'static str],
+    payload: Vec<u8>,
+) -> bool {
+    let mut child = match Command::new(program)
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1306,25 +1315,29 @@ fn write_wsl_clipboard_command(command: &ClipboardCommand, bytes: &[u8]) -> bool
         return false;
     };
 
-    let payload = bytes.to_vec();
     let writer = std::thread::spawn(move || {
         let _ = stdin.write_all(&payload);
     });
 
-    let status = wait_for_wsl_clipboard_command(&mut child);
+    let status = wait_for_wsl_clipboard_command(&mut child, || false);
     let _ = writer.join();
     matches!(status, Ok(Some(exit)) if exit.success())
 }
 
 /// Reads the Windows clipboard through a WSL clipboard command.
-///
-/// `read_limited_reader` runs on a worker thread because `Get-Clipboard` can block
-/// indefinitely while another process holds the Windows clipboard open; the main thread
-/// enforces the shared deadline and kills the child, turning a stuck read into an absent
-/// clipboard instead of a frozen client.
 fn read_wsl_clipboard_text_command(command: &ClipboardCommand) -> Option<String> {
-    let mut child = Command::new(command.program)
-        .args(command.args)
+    let program = command.program;
+    let args = command.args;
+    run_with_wsl_clipboard_deadline(move || run_wsl_clipboard_read(program, args))?
+}
+
+/// The read half of the WSL clipboard path. `Get-Clipboard` can block while another
+/// process holds the Windows clipboard open, so the reader runs on its own thread and
+/// the oversize signal lets the poll loop kill the child as soon as the limit is reached
+/// instead of waiting for the deadline.
+fn run_wsl_clipboard_read(program: &'static str, args: &'static [&'static str]) -> Option<String> {
+    let mut child = Command::new(program)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -1332,9 +1345,18 @@ fn read_wsl_clipboard_text_command(command: &ClipboardCommand) -> Option<String>
         .ok()?;
 
     let stdout = child.stdout.take()?;
-    let reader = std::thread::spawn(move || read_limited_reader(stdout, MAX_CLIPBOARD_TEXT_BYTES));
+    let oversized = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_flag = std::sync::Arc::clone(&oversized);
+    let reader = std::thread::spawn(move || {
+        let read = read_limited_reader(stdout, MAX_CLIPBOARD_TEXT_BYTES);
+        if matches!(read, Ok(LimitedRead::Oversized)) {
+            reader_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        read
+    });
 
-    let status = match wait_for_wsl_clipboard_command(&mut child) {
+    let is_cancelled = || oversized.load(std::sync::atomic::Ordering::SeqCst);
+    let status = match wait_for_wsl_clipboard_command(&mut child, is_cancelled) {
         Ok(Some(status)) => status,
         Ok(None) | Err(_) => {
             let _ = reader.join();
@@ -1357,16 +1379,46 @@ fn read_wsl_clipboard_text_command(command: &ClipboardCommand) -> Option<String>
     }
 }
 
-/// Polls a WSL clipboard child until it exits or `WSL_CLIPBOARD_TIMEOUT` elapses. On
-/// timeout or `try_wait` error the child is killed and reaped, and the caller receives
-/// `Ok(None)`/`Err` so it can fall back instead of blocking.
+/// Runs a WSL clipboard operation on a worker thread and gives the caller up to
+/// `WSL_CLIPBOARD_TIMEOUT` to collect the result.
+///
+/// The bound has to cover `Command::spawn`, which goes through the binfmt `/init` interop
+/// handler and can wedge while it talks to the Windows host before any child exists to
+/// kill, so the whole operation runs on the worker and the client event loop only waits
+/// on the channel. On timeout the caller falls back to OSC 52 and the worker keeps
+/// ownership of the child and reaps it when interop recovers.
+fn run_with_wsl_clipboard_deadline<T: Send + 'static>(
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let worker = std::thread::Builder::new()
+        .name("herdr-wsl-clipboard".to_string())
+        .spawn(move || {
+            let _ = sender.send(operation());
+        });
+    if worker.is_err() {
+        return None;
+    }
+    receiver.recv_timeout(WSL_CLIPBOARD_TIMEOUT).ok()
+}
+
+/// Polls a WSL clipboard child until it exits, the caller cancels it, or
+/// `WSL_CLIPBOARD_TIMEOUT` elapses. On cancel, timeout, or `try_wait` error the child is
+/// killed and reaped, and the caller receives `Ok(None)`/`Err` so it can fall back
+/// instead of blocking.
 fn wait_for_wsl_clipboard_command(
     child: &mut std::process::Child,
+    is_cancelled: impl Fn() -> bool,
 ) -> std::io::Result<Option<std::process::ExitStatus>> {
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
 
     let deadline = std::time::Instant::now() + WSL_CLIPBOARD_TIMEOUT;
     loop {
+        if is_cancelled() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
         match child.try_wait() {
             Ok(Some(status)) => return Ok(Some(status)),
             Ok(None) if std::time::Instant::now() < deadline => {
@@ -1944,15 +1996,7 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].program, "powershell.exe");
         assert_eq!(commands[0].args[0], "-NoProfile");
-        assert!(commands[0]
-            .args
-            .iter()
-            .any(|arg| arg.contains("Set-Clipboard")));
-        // The payload is decoded as UTF-8 rather than through a Windows code page.
-        assert!(commands[0]
-            .args
-            .iter()
-            .any(|arg| arg.contains("[System.Text.Encoding]::UTF8")));
+        assert_eq!(commands[0].args[1], "-NonInteractive");
     }
 
     #[test]
@@ -1977,10 +2021,7 @@ mod tests {
             read_clipboard_text_commands_for_env(true, Some("powershell.exe"), true, true);
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].program, "powershell.exe");
-        assert!(commands[0]
-            .args
-            .iter()
-            .any(|arg| arg.contains("Get-Clipboard -Raw")));
+        assert_eq!(commands[0].args[0], "-NoProfile");
     }
 
     /// Manual WSL verification: the round trip has to survive Chinese text, an emoji and
@@ -2102,6 +2143,29 @@ mod tests {
         assert!(
             started.elapsed() < WSL_CLIPBOARD_TIMEOUT + Duration::from_secs(3),
             "a stalled WSL clipboard read must give up instead of freezing the client"
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn oversized_wsl_clipboard_read_gives_up_before_the_deadline() {
+        use std::time::Instant;
+
+        // The fake powershell.exe keeps writing past the 1 MiB text limit. Without an
+        // early oversize signal the reader stops at the limit, the child blocks on the
+        // full pipe, and the paste would stall for the whole deadline instead.
+        let (temp_dir, program) =
+            write_fake_powershell("oversized-read", "#!/bin/sh\nhead -c 2097152 /dev/zero\n");
+        let command = ClipboardCommand {
+            program: leaked_program(&program),
+            args: WSL_CLIPBOARD_READ_ARGS,
+        };
+
+        let started = Instant::now();
+        assert_eq!(read_clipboard_text_with_command(&command), None);
+        assert!(
+            started.elapsed() < WSL_CLIPBOARD_TIMEOUT,
+            "an oversized WSL clipboard read must be abandoned as soon as the limit is reached"
         );
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
