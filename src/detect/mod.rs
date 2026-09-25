@@ -895,10 +895,14 @@ mod tests {
 
     #[test]
     fn moved_agent_detection_routes_through_production_dispatch() {
-        let detection = detect_agent(Some(Agent::Pi), "Working...");
+        let detection = detect_agent(Some(Agent::Pi), "⠋ Working...");
 
         assert_eq!(detection.state, AgentState::Working);
         assert!(detection.visible_working);
+
+        // Only the indicator counts: the phrase inside pane content is not a run.
+        let prose = detect_agent(Some(Agent::Pi), "see the note about Working... state\n> _");
+        assert_ne!(prose.state, AgentState::Working);
     }
 
     // ---- Agent identification ----

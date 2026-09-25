@@ -135,6 +135,8 @@ pub struct App {
     pub(crate) update_manifest_check_enabled: bool,
     pub(crate) loaded_host_cursor: crate::config::HostCursorModeConfig,
     pub(crate) agent_metadata_deadline: Option<Instant>,
+    /// When the oldest trusted `working` report is due to be re-examined.
+    pub(crate) stale_working_report_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
@@ -599,6 +601,7 @@ impl App {
             update_manifest_check_enabled: config.update.manifest_check,
             loaded_host_cursor: config.ui.host_cursor,
             agent_metadata_deadline: None,
+            stale_working_report_deadline: None,
             pending_agent_resume_deadline: None,
             session_save_deadline: None,
             session_save_thread: None,

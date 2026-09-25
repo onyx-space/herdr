@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
@@ -7,6 +7,7 @@ use crate::api::schema::{
     PaneReadResult, ResponseResult,
 };
 use crate::app::App;
+use crate::terminal::state::STALE_WORKING_REPORT_AFTER;
 
 use super::responses::{encode_error, encode_error_body, encode_success};
 
@@ -277,9 +278,22 @@ impl App {
             return agent_not_found(id, &target.target);
         };
         if terminal.full_lifecycle_hook_authority_active() {
+            let now = Instant::now();
+            let authority = terminal.hook_authority.as_ref();
             let explain = serde_json::json!({
                 "agent": terminal.effective_agent_label().unwrap_or("unknown"),
                 "state": crate::detect::manifest::agent_state_label(terminal.state),
+                // A full-lifecycle integration owns this pane's state, so the
+                // report behind it is the only evidence there is. `reported_state`
+                // and `stale_report` make the retirement of an aged `working`
+                // report visible instead of a pane silently changing colour.
+                "reported_state": authority
+                    .map(|authority| crate::detect::manifest::agent_state_label(authority.state)),
+                "reported_age_ms": terminal
+                    .hook_report_age(now)
+                    .map(|age| age.as_millis() as u64),
+                "stale_report": authority.is_some_and(|authority| authority.stale),
+                "stale_report_after_ms": STALE_WORKING_REPORT_AFTER.as_millis() as u64,
                 "manifest_source": null,
                 "manifest_version": null,
                 "cached_remote_version": null,

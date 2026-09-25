@@ -21,6 +21,11 @@ impl TerminalRuntime {
         self.0.shutdown();
     }
 
+    /// How long since this pane last wrote to its terminal.
+    pub fn output_quiet_for(&self, now: std::time::Instant) -> std::time::Duration {
+        self.0.output_quiet_for(now)
+    }
+
     #[cfg(unix)]
     pub fn duplicate_handoff_fd(&self) -> std::io::Result<std::os::fd::RawFd> {
         self.0.duplicate_handoff_fd()

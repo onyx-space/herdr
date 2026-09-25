@@ -44,6 +44,8 @@ Herdr first detects the foreground process in each pane. After that, each pane h
 
 For agents with complete lifecycle hooks, the integration is authoritative when it is installed and actively reporting for the running pane. Herdr uses those hook reports for `idle`, `working`, `blocked`, and session identity. It does not also run screen manifest fallback for that same lifecycle authority. This avoids two competing sources of truth.
 
+A `working` report is retired to `unknown` if it ages out while the pane stays silent, because a run in flight keeps repainting its pane. This bounds a lost report: one skipped or dropped transition no longer leaves a finished pane reading as working. `agent list` shows that pane as `unknown`, and `agent explain` shows `stale_report` with the `reported_state` and `reported_age_ms` behind the retirement. `idle` and `blocked` reports are never retired; only an accurate new report replaces them.
+
 For agents without complete lifecycle hooks, Herdr identifies the foreground process and reads the live bottom-buffer screen snapshot. It evaluates TOML manifests against that snapshot to classify `idle`, `working`, and `blocked`. For agents that emit them, manifests can also match terminal title and progress (OSC) sequences as detection evidence; when that evidence is absent, screen rules carry detection on their own.
 
 The screen snapshot comes from the recent bottom of the pane buffer, not the scrolled viewport. If you scroll back in Herdr, detection still follows the live agent UI at the bottom.

@@ -118,7 +118,7 @@ fn agent_wait_exits_when_done_status_matches() {
     let fake_pi = bin_dir.join("pi");
     fs::write(
         &fake_pi,
-        "#!/bin/sh\nprintf 'starting\\n'\nsleep 4\nprintf 'Working...\\n'\nsleep 1\nprintf '\\033[2J\\033[Hdone\\n'\n",
+        "#!/bin/sh\nprintf 'starting\\n'\nsleep 4\nprintf '⠋ Working...\\n'\nsleep 1\nprintf '\\033[2J\\033[Hdone\\n'\n",
     )
     .unwrap();
     #[cfg(unix)]

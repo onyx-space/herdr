@@ -22,7 +22,41 @@ pub struct HookAuthority {
     pub message: Option<String>,
     pub reported_at: Instant,
     pub session_ref: Option<crate::agent_resume::AgentSessionRef>,
+    /// The report stopped being trustworthy: it aged out while the pane kept
+    /// producing no output. See `STALE_WORKING_REPORT_AFTER`.
+    pub stale: bool,
 }
+
+impl HookAuthority {
+    /// The state this report still asserts.
+    ///
+    /// A retired report stops asserting `working`: the pane reads `Unknown`
+    /// until a fresh report arrives, so a lost report cannot latch the pane
+    /// yellow and a stale report cannot claim a run finished either.
+    pub(crate) fn effective_state(&self) -> AgentState {
+        if self.stale {
+            AgentState::Unknown
+        } else {
+            self.state
+        }
+    }
+}
+
+/// How long a full-lifecycle integration's `working` report is trusted without a
+/// follow-up report before it may be retired.
+///
+/// These integrations report on lifecycle hooks only (`agent_start`,
+/// `agent_settled`), so a run in flight sends nothing in between. A run in
+/// flight does repaint its TUI (pi animates its working indicator every 80 ms),
+/// so the age alone is not enough to call a report stale: see
+/// `TerminalState::retire_stale_working_report_at`.
+pub(crate) const STALE_WORKING_REPORT_AFTER: Duration = Duration::from_secs(60);
+
+/// How often a still-active `working` report is re-checked for staleness.
+///
+/// Bounds how long a pane that went silent just after a check waits for the
+/// next one, and keeps the check off a hot loop.
+pub(crate) const STALE_WORKING_REPORT_RECHECK: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SuppressedFullLifecycleHookReport {
@@ -738,6 +772,7 @@ impl TerminalState {
             message,
             reported_at: now,
             session_ref,
+            stale: false,
         });
         let current_session = self.current_session_identity_for_persistence();
         Some(TerminalStateMutation {
@@ -988,6 +1023,7 @@ impl TerminalState {
                     message: message.map(str::to_string),
                     reported_at,
                     session_ref: Some(session_ref),
+                    stale: false,
                 },
                 seq,
             });
@@ -1855,6 +1891,66 @@ impl TerminalState {
         self.live_full_lifecycle_hook_authority()
     }
 
+    /// How long ago the accepted hook report arrived.
+    pub(crate) fn hook_report_age(&self, now: Instant) -> Option<Duration> {
+        self.hook_authority
+            .as_ref()
+            .map(|authority| now.saturating_duration_since(authority.reported_at))
+    }
+
+    /// When the accepted `working` report may next be re-examined.
+    ///
+    /// A retired report needs no further check, and no other state is bounded
+    /// by time: `idle` and `blocked` stay valid until the integration says
+    /// otherwise.
+    pub(crate) fn next_stale_working_report_deadline(&self) -> Option<Instant> {
+        let authority = self.hook_authority.as_ref()?;
+        if authority.stale || authority.state != AgentState::Working {
+            return None;
+        }
+        Some(authority.reported_at + STALE_WORKING_REPORT_AFTER)
+    }
+
+    /// Retire an aged `working` report whose run cannot still be in flight.
+    ///
+    /// The caller supplies the liveness half of the check: this method only
+    /// enforces that the report has outlived `STALE_WORKING_REPORT_AFTER` and
+    /// that it is still the trusted authority. Retiring degrades the pane to
+    /// `Unknown` rather than `Idle` - a missing report is not evidence that the
+    /// run finished - and a fresh report clears it again.
+    pub(crate) fn retire_stale_working_report_at(
+        &mut self,
+        now: Instant,
+    ) -> Option<TerminalStateMutation> {
+        let authority = self.hook_authority.as_ref()?;
+        if authority.stale
+            || authority.state != AgentState::Working
+            || now.saturating_duration_since(authority.reported_at) < STALE_WORKING_REPORT_AFTER
+        {
+            return None;
+        }
+        let previous_agent_label = self.effective_agent_label().map(str::to_string);
+        let previous_known_agent = self.effective_known_agent();
+        let previous_state = self.state;
+        let previous_presentation = self.effective_presentation_for_state_at(previous_state, now);
+        let previous_session = self.current_session_identity_for_persistence();
+        if let Some(authority) = self.hook_authority.as_mut() {
+            authority.stale = true;
+        }
+        Some(TerminalStateMutation {
+            effective_state_change: self.recompute_effective_state(
+                previous_agent_label,
+                previous_known_agent,
+                previous_state,
+                previous_presentation,
+                now,
+            ),
+            session_ref_changed: previous_session
+                != self.current_session_identity_for_persistence(),
+            agent_released: false,
+        })
+    }
+
     fn visible_blocker_overrides_hook(&self) -> bool {
         if self.live_full_lifecycle_hook_authority() {
             return false;
@@ -2167,7 +2263,7 @@ impl TerminalState {
             self.hook_authority
                 .as_ref()
                 .filter(|authority| self.hook_authority_is_effective(authority))
-                .map(|authority| authority.state)
+                .map(|authority| authority.effective_state())
                 .unwrap_or(self.fallback_state)
         };
         let agent_label = self.effective_agent_label().map(str::to_string);
@@ -2322,6 +2418,106 @@ mod tests {
         };
 
         assert_eq!(stabilize_agent_detection(detection), AgentState::Idle);
+    }
+
+    #[test]
+    fn stale_working_report_retires_after_the_stale_window() {
+        let mut terminal = test_terminal();
+        let now = Instant::now();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        let session_ref =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("stale-window.jsonl"))
+                .unwrap();
+        anchor_full_lifecycle_session(
+            &mut terminal,
+            Agent::Pi,
+            "herdr:pi",
+            "pi",
+            session_ref.clone(),
+        );
+        terminal.set_hook_authority_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            Some(session_ref.clone()),
+            None,
+            now,
+        );
+
+        assert_eq!(terminal.state, AgentState::Working);
+        assert_eq!(
+            terminal.next_stale_working_report_deadline(),
+            Some(now + STALE_WORKING_REPORT_AFTER)
+        );
+        assert_eq!(
+            terminal.hook_report_age(now + Duration::from_secs(5)),
+            Some(Duration::from_secs(5))
+        );
+
+        // Inside the window the report stands.
+        assert!(terminal
+            .retire_stale_working_report_at(
+                now + STALE_WORKING_REPORT_AFTER - Duration::from_millis(1)
+            )
+            .is_none());
+        assert_eq!(terminal.state, AgentState::Working);
+
+        // Aged out, the pane stops reading yellow without claiming a run ended.
+        let change = terminal
+            .retire_stale_working_report_at(now + STALE_WORKING_REPORT_AFTER)
+            .and_then(|mutation| mutation.effective_state_change)
+            .expect("an aged working report should retire");
+        assert_eq!(change.previous_state, AgentState::Working);
+        assert_eq!(change.state, AgentState::Unknown);
+        assert_eq!(terminal.state, AgentState::Unknown);
+        assert!(terminal.hook_authority.as_ref().unwrap().stale);
+
+        // Retirement is idempotent and schedules no further check.
+        assert!(terminal
+            .retire_stale_working_report_at(now + Duration::from_secs(3600))
+            .is_none());
+        assert_eq!(terminal.next_stale_working_report_deadline(), None);
+
+        // A fresh report is trusted again.
+        terminal.set_hook_authority_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            Some(session_ref),
+            None,
+            now + STALE_WORKING_REPORT_AFTER + Duration::from_secs(1),
+        );
+        assert_eq!(terminal.state, AgentState::Working);
+        assert!(!terminal.hook_authority.as_ref().unwrap().stale);
+        assert_eq!(
+            terminal.next_stale_working_report_deadline(),
+            Some(now + STALE_WORKING_REPORT_AFTER * 2 + Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn idle_and_blocked_reports_are_never_retired() {
+        for state in [AgentState::Idle, AgentState::Blocked] {
+            let mut terminal = test_terminal();
+            let now = Instant::now();
+            terminal.set_hook_authority_at(
+                "herdr:custom".into(),
+                "custom-agent".into(),
+                state,
+                None,
+                None,
+                None,
+                now,
+            );
+            assert_eq!(terminal.state, state);
+            assert_eq!(terminal.next_stale_working_report_deadline(), None);
+            assert!(terminal
+                .retire_stale_working_report_at(now + Duration::from_secs(3600))
+                .is_none());
+            assert_eq!(terminal.state, state);
+        }
     }
 
     #[test]

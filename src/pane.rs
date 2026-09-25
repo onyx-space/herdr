@@ -1260,6 +1260,7 @@ pub struct PaneRuntime {
     content_seq: Arc<AtomicU64>,
     content_write_lock: Arc<Mutex<()>>,
     detection_content_seq: Arc<AtomicU64>,
+    output_activity: Arc<AtomicU64>,
     full_lifecycle_authority_active: Arc<AtomicBool>,
     detect_reset_notify: Arc<Notify>,
     pending_release: Arc<Mutex<Option<PendingAgentRelease>>>,
@@ -1267,6 +1268,21 @@ pub struct PaneRuntime {
     // Task handles for deterministic shutdown
     compression: TerminalCompressionTask,
     detect_handle: Option<tokio::task::AbortHandle>,
+}
+
+/// Monotonic millisecond clock for pane output activity.
+///
+/// `Instant` cannot sit in an atomic, so the clock counts from a process-local
+/// origin fixed on first use. Only differences between two readings are read.
+static OUTPUT_ACTIVITY_ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+fn output_activity_millis(now: std::time::Instant) -> u64 {
+    let origin = OUTPUT_ACTIVITY_ORIGIN.get_or_init(std::time::Instant::now);
+    now.saturating_duration_since(*origin).as_millis() as u64
+}
+
+fn output_activity_millis_now() -> u64 {
+    output_activity_millis(std::time::Instant::now())
 }
 
 enum PaneRuntimeIo {
@@ -1866,6 +1882,16 @@ impl PaneRuntime {
         self.preserve_processes_on_drop = true;
     }
 
+    /// How long this pane has gone without writing to its terminal.
+    ///
+    /// A run in flight repaints the TUI (pi animates its working indicator
+    /// every 80 ms), so a pane that has been silent for a whole stale window is
+    /// not running a turn even when the last hook report said `working`.
+    pub(crate) fn output_quiet_for(&self, now: std::time::Instant) -> std::time::Duration {
+        let last = self.output_activity.load(Ordering::Relaxed);
+        std::time::Duration::from_millis(output_activity_millis(now).saturating_sub(last))
+    }
+
     #[cfg(unix)]
     pub fn duplicate_handoff_fd(&self) -> std::io::Result<std::os::fd::RawFd> {
         self.io.duplicate_handoff_fd()
@@ -2181,6 +2207,7 @@ impl PaneRuntime {
         let content_seq = Arc::new(AtomicU64::new(0));
         let content_write_lock = Arc::new(Mutex::new(()));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let output_activity = Arc::new(AtomicU64::new(output_activity_millis_now()));
 
         let io = {
             let terminal = terminal.clone();
@@ -2190,6 +2217,7 @@ impl PaneRuntime {
             let content_seq = content_seq.clone();
             let content_write_lock = content_write_lock.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let output_activity = output_activity.clone();
             let child_pid = child_pid.clone();
             let read_events = events.clone();
             let reported_cwd = reported_cwd.clone();
@@ -2208,6 +2236,7 @@ impl PaneRuntime {
                 content_seq.fetch_add(1, Ordering::Release);
                 drop(_content_write_guard);
                 compression_wake.wake();
+                output_activity.store(output_activity_millis_now(), Ordering::Relaxed);
                 publish_terminal_bells(pane_id, result.terminal_bells, &read_events);
                 observe_detection_content_change(bytes, &detection_content_seq);
                 let title_requested =
@@ -2283,6 +2312,7 @@ impl PaneRuntime {
             content_seq,
             content_write_lock,
             detection_content_seq,
+            output_activity,
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
@@ -2342,6 +2372,7 @@ impl PaneRuntime {
         let child_wait_completed = Arc::new(AtomicBool::new(false));
         let content_seq = Arc::new(AtomicU64::new(0));
         let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let output_activity = Arc::new(AtomicU64::new(output_activity_millis_now()));
         let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
         {
             let child_pid = child_pid.clone();
@@ -2385,6 +2416,7 @@ impl PaneRuntime {
             let content_seq = content_seq.clone();
             let content_write_lock = content_write_lock.clone();
             let detection_content_seq = detection_content_seq.clone();
+            let output_activity = output_activity.clone();
             let child_pid = child_pid.clone();
             let events = events.clone();
             let reported_cwd = reported_cwd.clone();
@@ -2402,6 +2434,7 @@ impl PaneRuntime {
                 content_seq.fetch_add(1, Ordering::Release);
                 drop(_content_write_guard);
                 compression_wake.wake();
+                output_activity.store(output_activity_millis_now(), Ordering::Relaxed);
                 publish_terminal_bells(pane_id, result.terminal_bells, &events);
                 if agent_detection == AgentDetection::Enabled {
                     observe_detection_content_change(bytes, &detection_content_seq);
@@ -2859,6 +2892,7 @@ impl PaneRuntime {
             content_seq,
             content_write_lock,
             detection_content_seq,
+            output_activity,
             full_lifecycle_authority_active,
             detect_reset_notify,
             pending_release,
@@ -3525,6 +3559,7 @@ impl PaneRuntime {
                 content_seq: Arc::new(AtomicU64::new(0)),
                 content_write_lock: Arc::new(Mutex::new(())),
                 detection_content_seq: Arc::new(AtomicU64::new(0)),
+                output_activity: Arc::new(AtomicU64::new(output_activity_millis_now())),
                 full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
                 detect_reset_notify: Arc::new(Notify::new()),
                 pending_release: Arc::new(Mutex::new(None)),
@@ -4377,6 +4412,7 @@ mod tests {
             content_seq: Arc::new(AtomicU64::new(0)),
             content_write_lock: Arc::new(Mutex::new(())),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
+            output_activity: Arc::new(AtomicU64::new(output_activity_millis_now())),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
@@ -4414,6 +4450,7 @@ mod tests {
             content_seq: Arc::new(AtomicU64::new(0)),
             content_write_lock: Arc::new(Mutex::new(())),
             detection_content_seq: Arc::new(AtomicU64::new(0)),
+            output_activity: Arc::new(AtomicU64::new(output_activity_millis_now())),
             full_lifecycle_authority_active: Arc::new(AtomicBool::new(false)),
             detect_reset_notify: Arc::new(Notify::new()),
             pending_release: Arc::new(Mutex::new(None)),
@@ -5176,6 +5213,38 @@ mod tests {
         )
         .await
         .expect("re-entering active authority should notify detection reset");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pty_output_refreshes_the_pane_activity_clock() {
+        let (events, _event_rx) = mpsc::channel(8);
+        let runtime = PaneRuntime::spawn_shell_command(
+            PaneId::from_raw(44),
+            24,
+            80,
+            std::env::temp_dir(),
+            "printf 'a'; sleep 0.4; printf 'b'; sleep 5",
+            &PaneLaunchEnv::default(),
+            AgentDetection::Disabled,
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        let quiet = runtime.output_quiet_for(std::time::Instant::now());
+        // The second write landed around 400 ms in, so anything near the full
+        // 800 ms means the clock never followed the PTY output.
+        assert!(
+            quiet < std::time::Duration::from_millis(700),
+            "activity clock did not follow output: {quiet:?}"
+        );
+        runtime.shutdown();
     }
 
     #[cfg(unix)]
