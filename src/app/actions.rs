@@ -327,7 +327,101 @@ impl AppState {
 // Workspace operations
 // ---------------------------------------------------------------------------
 
+fn pane_state_update_for_effective_change(
+    ws_idx: usize,
+    pane_id: PaneId,
+    previous_seen: bool,
+    change: &crate::terminal::EffectiveStateChange,
+    seen: bool,
+) -> PaneStateUpdate {
+    PaneStateUpdate {
+        pane_id,
+        ws_idx,
+        previous_agent_label: change.previous_agent_label.clone(),
+        previous_known_agent: change.previous_known_agent,
+        previous_state: change.previous_state,
+        previous_seen,
+        previous_presentation: change.previous_presentation.clone(),
+        agent_label: change.agent_label.clone(),
+        known_agent: change.known_agent,
+        state: change.state,
+        seen,
+        presentation: change.presentation.clone(),
+        agent_name_changed: false,
+        agent_released: false,
+        agent_release_status: None,
+        suppress_completion: false,
+    }
+}
+
 impl AppState {
+    /// Every pane with the terminal backing it, in workspace order.
+    fn pane_terminals(&self) -> Vec<(usize, PaneId, crate::terminal::TerminalId)> {
+        self.workspaces
+            .iter()
+            .enumerate()
+            .flat_map(|(ws_idx, workspace)| {
+                workspace.tabs.iter().flat_map(move |tab| {
+                    tab.layout
+                        .pane_ids()
+                        .into_iter()
+                        .filter_map(move |pane_id| {
+                            workspace
+                                .pane_state(pane_id)
+                                .map(|pane| (ws_idx, pane_id, pane.attached_terminal_id.clone()))
+                        })
+                })
+            })
+            .collect()
+    }
+
+    /// When the oldest trusted `working` report may be re-examined.
+    ///
+    /// `None` when no pane carries a `working` report, so a healthy fleet
+    /// schedules no work for this rule.
+    pub(crate) fn next_stale_working_report_deadline(&self) -> Option<std::time::Instant> {
+        self.terminals
+            .values()
+            .filter_map(|terminal| terminal.next_stale_working_report_deadline())
+            .min()
+    }
+
+    /// Retire `working` reports that aged out on panes that stopped producing
+    /// output.
+    ///
+    /// `output_quiet` names the terminals whose pane has written nothing for a
+    /// whole stale window; the caller reads that from the live runtimes. Age
+    /// alone never retires a report, because a run in flight stays silent
+    /// between lifecycle reports while still repainting its pane.
+    pub(crate) fn expire_stale_working_reports_at(
+        &mut self,
+        now: std::time::Instant,
+        output_quiet: &std::collections::HashSet<crate::terminal::TerminalId>,
+    ) -> Vec<PaneStateUpdate> {
+        self.pane_terminals()
+            .into_iter()
+            .filter_map(|(ws_idx, pane_id, terminal_id)| {
+                if !output_quiet.contains(&terminal_id) {
+                    return None;
+                }
+                let previous_seen = self.workspaces[ws_idx].pane_state(pane_id)?.seen;
+                let mutation = self
+                    .terminals
+                    .get_mut(&terminal_id)?
+                    .retire_stale_working_report_at(now)?;
+                let change = mutation.effective_state_change?;
+                let seen = self.apply_pane_state_change(ws_idx, pane_id, &change, false)?;
+                Some(pane_state_update_for_effective_change(
+                    ws_idx,
+                    pane_id,
+                    previous_seen,
+                    &change,
+                    seen,
+                ))
+            })
+            .collect()
+    }
+
     pub(crate) fn next_agent_metadata_expiry(&self) -> Option<std::time::Instant> {
         self.terminals
             .values()
@@ -350,23 +444,7 @@ impl AppState {
         scheduled_deadline: std::time::Instant,
         now: std::time::Instant,
     ) -> Vec<PaneStateUpdate> {
-        let pane_terminals: Vec<_> = self
-            .workspaces
-            .iter()
-            .enumerate()
-            .flat_map(|(ws_idx, ws)| {
-                ws.tabs.iter().flat_map(move |tab| {
-                    tab.layout
-                        .pane_ids()
-                        .into_iter()
-                        .filter_map(move |pane_id| {
-                            ws.pane_state(pane_id)
-                                .map(|pane| (ws_idx, pane_id, pane.attached_terminal_id.clone()))
-                        })
-                })
-            })
-            .collect();
-        pane_terminals
+        self.pane_terminals()
             .into_iter()
             .filter_map(|(ws_idx, pane_id, terminal_id)| {
                 let previous_seen = self.workspaces[ws_idx].pane_state(pane_id)?.seen;
@@ -376,25 +454,13 @@ impl AppState {
                     .expire_agent_metadata_at(scheduled_deadline, now)?;
                 let change = mutation.effective_state_change?;
                 let seen = self.apply_pane_state_change(ws_idx, pane_id, &change, false)?;
-                let update = PaneStateUpdate {
-                    pane_id,
+                Some(pane_state_update_for_effective_change(
                     ws_idx,
-                    previous_agent_label: change.previous_agent_label.clone(),
-                    previous_known_agent: change.previous_known_agent,
-                    previous_state: change.previous_state,
+                    pane_id,
                     previous_seen,
-                    previous_presentation: change.previous_presentation.clone(),
-                    agent_label: change.agent_label.clone(),
-                    known_agent: change.known_agent,
-                    state: change.state,
+                    &change,
                     seen,
-                    presentation: change.presentation.clone(),
-                    agent_name_changed: false,
-                    agent_released: false,
-                    agent_release_status: None,
-                    suppress_completion: false,
-                };
-                Some(update)
+                ))
             })
             .collect()
     }
@@ -3618,6 +3684,84 @@ mod tests {
 
         assert!(second_updates.is_empty());
         assert!(state.session_dirty);
+    }
+
+    #[test]
+    fn silent_working_report_is_retired_within_a_bounded_interval() {
+        let mut state = app_with_workspaces(&["lane"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let terminal_id = state.workspaces[0]
+            .pane_state(pane_id)
+            .unwrap()
+            .attached_terminal_id
+            .clone();
+        let now = std::time::Instant::now();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        terminal.set_hook_authority_at(
+            "herdr:custom".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            None,
+            None,
+            now,
+        );
+        assert_eq!(terminal.state, AgentState::Working);
+
+        let deadline = now + crate::terminal::state::STALE_WORKING_REPORT_AFTER;
+        assert_eq!(state.next_stale_working_report_deadline(), Some(deadline));
+        assert_eq!(
+            state.workspaces[0].aggregate_state(&state.terminals).0,
+            AgentState::Working
+        );
+
+        // A pane that is still writing to its terminal keeps its report: a run
+        // in flight is silent between lifecycle reports.
+        assert!(state
+            .expire_stale_working_reports_at(deadline, &std::collections::HashSet::new())
+            .is_empty());
+        assert_eq!(state.terminals[&terminal_id].state, AgentState::Working);
+        assert_eq!(state.next_stale_working_report_deadline(), Some(deadline));
+
+        // A silent pane stops reading yellow once the report ages out.
+        let quiet: std::collections::HashSet<_> = [terminal_id.clone()].into_iter().collect();
+        let updates = state.expire_stale_working_reports_at(deadline, &quiet);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].state, AgentState::Unknown);
+        assert_eq!(state.terminals[&terminal_id].state, AgentState::Unknown);
+        assert!(
+            state.terminals[&terminal_id]
+                .hook_authority
+                .as_ref()
+                .unwrap()
+                .stale
+        );
+        assert_eq!(state.next_stale_working_report_deadline(), None);
+        // The workspace light follows its panes through the same aggregation.
+        assert_eq!(
+            state.workspaces[0].aggregate_state(&state.terminals).0,
+            AgentState::Unknown
+        );
+
+        // Retiring is idempotent.
+        assert!(state
+            .expire_stale_working_reports_at(deadline, &quiet)
+            .is_empty());
+
+        // A fresh report clears the retirement.
+        let updates = state.handle_app_event(AppEvent::HookStateReported {
+            pane_id,
+            source: "herdr:custom".into(),
+            agent_label: "pi".into(),
+            state: AgentState::Working,
+            message: None,
+            seq: None,
+            session_ref: None,
+        });
+        assert_eq!(updates.len(), 1);
+        assert_eq!(state.terminals[&terminal_id].state, AgentState::Working);
+        assert!(state.next_stale_working_report_deadline().is_some());
     }
 
     #[test]

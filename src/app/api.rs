@@ -345,6 +345,7 @@ impl App {
             self.emit_pane_state_update(update);
         }
         self.sync_agent_metadata_deadline();
+        self.sync_stale_working_report_deadline();
         if let Some((
             overlay,
             was_overlay_active,
@@ -1666,6 +1667,75 @@ mod tests {
             response["result"]["explain"]["matched_rule"]["id"],
             "live_strong_blocker"
         );
+    }
+
+    #[tokio::test]
+    async fn agent_explain_reports_a_retired_working_report() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![crate::workspace::Workspace::test_new("agent-explain-stale")];
+        app.state.ensure_test_terminals();
+        let pane_id = app.state.workspaces[0].tabs[0].root_pane;
+        let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let now = Instant::now();
+        let reported_at = now - crate::terminal::state::STALE_WORKING_REPORT_AFTER;
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.detected_agent = Some(Agent::Pi);
+        terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+            source: "herdr:pi".into(),
+            agent: "pi".into(),
+            session_ref: crate::agent_resume::AgentSessionRef::path(
+                std::env::current_dir()
+                    .unwrap()
+                    .join("stale-explain.jsonl")
+                    .display()
+                    .to_string(),
+            )
+            .unwrap(),
+        });
+        terminal.set_hook_authority_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            None,
+            None,
+            reported_at,
+        );
+        terminal
+            .retire_stale_working_report_at(now)
+            .expect("an aged working report should retire");
+        let runtime = crate::terminal::TerminalRuntime::test_with_screen_bytes(80, 24, b"");
+        app.terminal_runtimes.insert(terminal_id, runtime);
+        let target = app.public_pane_id(0, pane_id).unwrap();
+
+        let response = app.handle_api_request(crate::api::schema::Request {
+            id: "agent_explain_stale".into(),
+            method: crate::api::schema::Method::AgentExplain(crate::api::schema::AgentTarget {
+                target,
+            }),
+        });
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let explain = &response["result"]["explain"];
+
+        assert_eq!(response["result"]["type"], "agent_explain");
+        assert_eq!(explain["state"], "unknown");
+        assert_eq!(explain["screen_detection_skipped"], true);
+        assert_eq!(explain["reported_state"], "working");
+        assert_eq!(explain["stale_report"], true);
+        assert_eq!(
+            explain["stale_report_after_ms"],
+            crate::terminal::state::STALE_WORKING_REPORT_AFTER.as_millis() as u64
+        );
+        assert!(explain["reported_age_ms"].as_u64().unwrap() >= 60_000);
     }
 
     #[tokio::test]

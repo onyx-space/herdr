@@ -5210,6 +5210,67 @@ fn headless_scheduled_tasks_expire_agent_metadata() {
         }));
 }
 
+#[tokio::test]
+async fn headless_scheduled_tasks_retires_a_stale_working_report() {
+    let mut server = test_headless_server();
+    let workspace = crate::workspace::Workspace::test_new("silent-lane");
+    let pane_id = workspace.tabs[0].root_pane;
+    let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+    server.app.state.workspaces = vec![workspace];
+    server.app.state.active = Some(0);
+    server.app.state.ensure_test_terminals();
+
+    let now = Instant::now();
+    server
+        .app
+        .state
+        .terminals
+        .get_mut(&terminal_id)
+        .expect("test terminal should exist")
+        .set_hook_authority_at(
+            "herdr:custom".into(),
+            "pi".into(),
+            crate::detect::AgentState::Working,
+            None,
+            None,
+            None,
+            now,
+        );
+    server.app.sync_stale_working_report_deadline();
+
+    // The scheduled-task pass schedules the check, keeps the report until it is
+    // due, and carries the retirement through to a client-visible update. The
+    // pane has no runtime here, so it counts as silent.
+    let deadline = server
+        .app
+        .stale_working_report_deadline
+        .expect("a working report should schedule a check");
+    assert!(!server.handle_scheduled_tasks_headless(deadline - Duration::from_millis(1), false));
+    assert_eq!(
+        server.app.state.terminals[&terminal_id].state,
+        crate::detect::AgentState::Working
+    );
+
+    assert!(server.handle_scheduled_tasks_headless(deadline, false));
+    assert_eq!(
+        server.app.state.terminals[&terminal_id].state,
+        crate::detect::AgentState::Unknown
+    );
+    assert_eq!(server.app.stale_working_report_deadline, None);
+    assert!(server
+        .app
+        .event_hub
+        .events_after(0)
+        .iter()
+        .any(|(_, event)| matches!(
+            &event.data,
+            crate::api::schema::EventData::PaneAgentStatusChanged {
+                agent_status: crate::api::schema::AgentStatus::Unknown,
+                ..
+            }
+        )));
+}
+
 #[test]
 fn headless_scheduled_tasks_clears_disabled_agent_manifest_update_deadline() {
     let mut server = test_headless_server();

@@ -3412,6 +3412,14 @@ impl HeadlessServer {
             changed = true;
         }
 
+        if self
+            .app
+            .stale_working_report_deadline
+            .is_some_and(|deadline| now >= deadline)
+        {
+            changed |= self.app.expire_stale_working_reports(now);
+        }
+
         changed |= self.app.handle_tab_bar_status_tasks(now);
 
         if geometry_dirty {

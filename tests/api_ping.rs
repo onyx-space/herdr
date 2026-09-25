@@ -1403,7 +1403,7 @@ fn events_subscribe_streams_workspace_tab_and_agent_events() {
     let fake_pi = bin_dir.join("pi");
     fs::write(
         &fake_pi,
-        "#!/bin/sh\nprintf 'Working...\\n'\nsleep 1\nprintf '\\033[2J\\033[Hdone\\n'\n",
+        "#!/bin/sh\nprintf '⠋ Working...\\n'\nsleep 1\nprintf '\\033[2J\\033[Hdone\\n'\n",
     )
     .unwrap();
     #[cfg(unix)]
@@ -1713,7 +1713,7 @@ fn pane_report_agent_updates_effective_state() {
 
     fs::create_dir_all(&bin_dir).unwrap();
     let fake_pi = bin_dir.join("pi");
-    fs::write(&fake_pi, "#!/bin/sh\nprintf 'Working...\\n'\nsleep 3\n").unwrap();
+    fs::write(&fake_pi, "#!/bin/sh\nprintf '⠋ Working...\\n'\nsleep 3\n").unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1980,7 +1980,7 @@ fn official_release_waits_for_confirmed_process_exit() {
     fs::write(
         &fake_pi,
         format!(
-            "#!/bin/sh\nprintf 'Working...\\n'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\n",
+            "#!/bin/sh\nprintf '⠋ Working...\\n'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\n",
             stop_file.display()
         ),
     )
@@ -2135,7 +2135,7 @@ fn pane_clear_agent_authority_restores_fallback_state() {
 
     fs::create_dir_all(&bin_dir).unwrap();
     let fake_pi = bin_dir.join("pi");
-    fs::write(&fake_pi, "#!/bin/sh\nprintf 'Working...\\n'\nsleep 3\n").unwrap();
+    fs::write(&fake_pi, "#!/bin/sh\nprintf '⠋ Working...\\n'\nsleep 3\n").unwrap();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -2258,7 +2258,7 @@ fn events_subscribe_streams_output_and_agent_status_events() {
     let fake_pi = bin_dir.join("pi");
     fs::write(
         &fake_pi,
-        "#!/bin/sh\nprintf 'Working...\\n'\nsleep 1\nprintf '\\033[2J\\033[Hdone\\n'\n",
+        "#!/bin/sh\nprintf '⠋ Working...\\n'\nsleep 1\nprintf '\\033[2J\\033[Hdone\\n'\n",
     )
     .unwrap();
     #[cfg(unix)]
@@ -2384,7 +2384,7 @@ fn pane_info_and_subscriptions_expose_done_agent_status() {
     fs::write(
         &fake_pi,
         format!(
-            "#!/bin/sh\nprintf 'starting\\n'\nsleep 4\nprintf 'Working...\\n'\nsleep 1\nprintf '\\033[2J\\033[Hdone\\n'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\n",
+            "#!/bin/sh\nprintf 'starting\\n'\nsleep 4\nprintf '⠋ Working...\\n'\nsleep 1\nprintf '\\033[2J\\033[Hdone\\n'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\n",
             stop_file.display()
         ),
     )

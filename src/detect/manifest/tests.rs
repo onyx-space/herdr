@@ -369,6 +369,45 @@ fn all_bundled_manifests_parse_and_validate() {
 }
 
 #[test]
+fn pi_manifest_ignores_working_text_in_screen_content() {
+    // Screens captured for the "pane stays yellow" investigation: a body line
+    // that merely mentions the word must not be read as a run in flight.
+    let prose = explain(
+        Agent::Pi,
+        "User: hello\nsee the note about Working... state\nAssistant: hi\n> _",
+    );
+    assert_ne!(prose.state, AgentState::Working);
+    assert_ne!(
+        prose.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("working_literal")
+    );
+
+    let idle = explain(Agent::Pi, "User: hello\nAssistant: hi\n> _");
+    assert_eq!(idle.state, AgentState::Idle);
+
+    // The indicators themselves still count: the bordered one, and the
+    // spinner line above the prompt.
+    let border = explain(Agent::Pi, "User: hi\n── ⠋ Working ──────────────────────");
+    assert_eq!(border.state, AgentState::Working);
+    assert_eq!(
+        border.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+        Some("working_border")
+    );
+    assert!(border.visible_working);
+
+    let spinner_line = explain(Agent::Pi, "User: hi\n\n⠋ Working...");
+    assert_eq!(spinner_line.state, AgentState::Working);
+    assert_eq!(
+        spinner_line
+            .matched_rule
+            .as_ref()
+            .map(|rule| rule.id.as_str()),
+        Some("working_literal")
+    );
+    assert!(spinner_line.visible_working);
+}
+
+#[test]
 fn devin_manifest_detects_idle_working_and_blocked_states() {
     let idle = explain(
         Agent::Devin,

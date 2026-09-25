@@ -1,16 +1,16 @@
 id = "pi"
-version = "2026.09.14.1"
+version = "2026.09.26.1"
 min_engine_version = 1
-updated_at = "2026-09-14T00:00:00Z"
+updated_at = "2026-09-26T00:00:00Z"
 aliases = ["herdr:pi"]
 
 [[rules]]
 id = "working_literal"
 state = "working"
 priority = 100
-region = "whole_recent"
+region = "bottom_non_empty_lines(6)"
 visible_working = true
-contains = ["Working..."]
+line_regex = ['^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Working\.\.\.']
 
 [[rules]]
 id = "working_border"

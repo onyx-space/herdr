@@ -204,6 +204,18 @@ fn print_agent_explain_text(explain: &serde_json::Value, verbose: bool) {
     if let Some(reason) = explain["screen_detection_skip_reason"].as_str() {
         println!("screen_detection_skip_reason: {reason}");
     }
+    if let Some(reported) = explain["reported_state"].as_str() {
+        println!("reported_state: {reported}");
+    }
+    if let Some(age) = explain["reported_age_ms"].as_u64() {
+        println!("reported_age_ms: {age}");
+    }
+    if explain["stale_report"].as_bool().unwrap_or(false) {
+        println!(
+            "stale_report: true (no report for {} ms on a silent pane; state degraded)",
+            explain["stale_report_after_ms"].as_u64().unwrap_or(0)
+        );
+    }
     if let Some(reason) = explain["skipped_update_reason"].as_str() {
         println!("skipped_update_reason: {reason}");
     }

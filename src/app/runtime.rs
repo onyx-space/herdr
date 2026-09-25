@@ -6,6 +6,7 @@ use std::time::Duration;
 use super::{
     background_update_check_enabled, App, AUTO_UPDATE_CHECK_INTERVAL, MIN_RENDER_INTERVAL,
 };
+use crate::terminal::state::{STALE_WORKING_REPORT_AFTER, STALE_WORKING_REPORT_RECHECK};
 fn retain_detached_process_after_wait(
     pid: u32,
     result: std::io::Result<Option<std::process::ExitStatus>>,
@@ -42,6 +43,67 @@ impl App {
 
     pub(crate) fn sync_agent_metadata_deadline(&mut self) {
         self.agent_metadata_deadline = self.state.next_agent_metadata_expiry();
+    }
+
+    /// Re-arm the stale-report check.
+    ///
+    /// A deadline that has already passed is pushed to
+    /// `STALE_WORKING_REPORT_RECHECK` ahead instead of firing immediately: an
+    /// aged report on a pane that is still producing output is not stale yet,
+    /// and re-checking it on a hot loop would burn a core.
+    pub(crate) fn sync_stale_working_report_deadline(&mut self) {
+        let now = Instant::now();
+        self.stale_working_report_deadline =
+            self.state
+                .next_stale_working_report_deadline()
+                .map(|deadline| {
+                    if deadline > now {
+                        deadline
+                    } else {
+                        now + STALE_WORKING_REPORT_RECHECK
+                    }
+                });
+    }
+
+    /// Retire `working` hook reports that aged out on silent panes.
+    pub(crate) fn expire_stale_working_reports(&mut self, now: Instant) -> bool {
+        if self
+            .stale_working_report_deadline
+            .is_none_or(|deadline| now < deadline)
+        {
+            return false;
+        }
+        let output_quiet = self.output_quiet_terminals(now);
+        let previous_toast = self.state.toast.clone();
+        let updates = self
+            .state
+            .expire_stale_working_reports_at(now, &output_quiet);
+        for update in &updates {
+            self.refresh_new_herdr_toast_context_for_update(update, &previous_toast);
+            self.emit_pane_state_update(update);
+        }
+        self.sync_stale_working_report_deadline();
+        !updates.is_empty()
+    }
+
+    /// Terminals whose pane has written nothing to its PTY for a whole stale
+    /// window. A pane with no live runtime cannot be running a turn.
+    fn output_quiet_terminals(
+        &self,
+        now: Instant,
+    ) -> std::collections::HashSet<crate::terminal::TerminalId> {
+        self.state
+            .terminals
+            .keys()
+            .filter(|terminal_id| {
+                self.terminal_runtimes
+                    .get(terminal_id)
+                    .is_none_or(|runtime| {
+                        runtime.output_quiet_for(now) >= STALE_WORKING_REPORT_AFTER
+                    })
+            })
+            .cloned()
+            .collect()
     }
 
     pub(crate) fn expire_due_metadata(&mut self, now: Instant) -> bool {
@@ -157,6 +219,7 @@ impl App {
             self.next_auto_update_check,
             self.next_agent_manifest_update_check,
             self.agent_metadata_deadline,
+            self.stale_working_report_deadline,
             self.pending_agent_resume_deadline,
             self.session_save_deadline,
             self.next_tab_bar_status_deadline(),
